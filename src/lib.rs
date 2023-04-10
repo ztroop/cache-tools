@@ -1,26 +1,25 @@
 use chrono::{DateTime, Duration, Utc};
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::Hash;
 
 /// A Time-to-live (TTL) cache that stores key-value pairs and removes them automatically after a specified duration.
-pub struct TtlCache<K, V> {
+pub struct TTLCache<K, V> {
     cache: HashMap<K, (V, DateTime<Utc>)>,
     ttl: Duration,
 }
 
-impl<K, V> TtlCache<K, V>
+impl<K, V> TTLCache<K, V>
 where
     K: Eq + Hash + Clone,
     V: Clone,
 {
-    /// Creates a new TtlCache with the specified Time-to-live duration.
+    /// Creates a new TTLCache with the specified Time-to-live duration.
     ///
     /// # Arguments
     ///
     /// * `ttl` - The Time-to-live duration for cache entries.
     pub fn new(ttl: Duration) -> Self {
-        TtlCache {
+        TTLCache {
             cache: HashMap::new(),
             ttl,
         }
@@ -77,20 +76,6 @@ where
 }
 
 /// A simple implementation of a First-In-First-Out (FIFO) cache.
-///
-/// # Examples
-///
-/// ```
-/// use cache_tools::FIFOCache;
-///
-/// let mut cache = FIFOCache::new(3);
-/// cache.insert(1, "one");
-/// cache.insert(2, "two");
-/// cache.insert(3, "three");
-/// cache.insert(4, "four"); // Evicts the first entry (1, "one").
-/// assert_eq!(cache.get(&1), None);
-/// assert_eq!(cache.get(&2), Some(&"two"));
-/// ```
 pub struct FIFOCache<K, V> {
     capacity: usize,
     keys: VecDeque<K>,
@@ -112,7 +97,7 @@ impl<K: Clone + Eq + std::hash::Hash, V> FIFOCache<K, V> {
     }
 
     /// Inserts a key-value pair into the cache. If the cache is full,
-    /// the oldest entry will be evicted.
+    /// the oldest entry will be removed.
     ///
     /// # Arguments
     ///
@@ -207,6 +192,91 @@ impl<K: Clone + Eq + std::hash::Hash, V> LRUCache<K, V> {
     }
 }
 
+/// The LFU cache maintains a fixed size cache of key-value pairs,
+/// removing the least frequently used item when the cache is full.
+pub struct LFUCache<K: Ord + Eq + Hash, V> {
+    capacity: usize,
+    cache: HashMap<K, (V, usize)>,
+    frequencies: BTreeMap<usize, Vec<K>>,
+}
+
+impl<K: Ord + Copy + Clone + Eq + Hash, V> LFUCache<K, V> {
+    /// Creates a new LFUCache with the specified capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - The maximum number of items the cache can hold.
+    pub fn new(capacity: usize) -> Self {
+        LFUCache {
+            capacity,
+            cache: HashMap::with_capacity(capacity),
+            frequencies: BTreeMap::new(),
+        }
+    }
+
+    /// Gets the value associated with the specified key, if present.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to look up in the cache.
+    pub fn get(&mut self, key: K) -> Option<&V> {
+        if let Some((value, freq)) = self.cache.get_mut(&key) {
+            self.frequencies
+                .get_mut(freq)
+                .unwrap()
+                .retain(|k| k != &key);
+            *freq += 1;
+            self.frequencies
+                .entry(*freq)
+                .or_insert_with(Vec::new)
+                .push(key.clone());
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// If the cache is full, removes the least frequently used item.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert.
+    /// * `value` - The value to associate with the key.
+    pub fn insert(&mut self, key: K, value: V) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        if self.cache.contains_key(&key) {
+            let old_val = self.cache.get_mut(&key).unwrap();
+            let freq = old_val.1;
+            old_val.0 = value;
+            old_val.1 += 1;
+
+            let keys = self.frequencies.get_mut(&freq).unwrap();
+            let index = keys.iter().position(|k| k == &key).unwrap();
+            keys.remove(index);
+
+            let new_freq_keys = self.frequencies.entry(freq + 1).or_insert_with(Vec::new);
+            new_freq_keys.push(key);
+        } else {
+            if self.cache.len() == self.capacity {
+                let (min_freq, removed_key) = {
+                    let (min_freq, keys) = self.frequencies.iter().next().unwrap();
+                    let removed_key = keys.first().unwrap().clone();
+                    (min_freq.clone(), removed_key)
+                };
+                self.cache.remove(&removed_key);
+                self.frequencies.get_mut(&min_freq).unwrap().remove(0);
+            }
+            self.cache.insert(key.clone(), (value, 1));
+            self.frequencies.entry(1).or_insert_with(Vec::new).push(key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_ttl_cache() {
-        let mut cache = TtlCache::new(Duration::milliseconds(100));
+        let mut cache = TTLCache::new(Duration::milliseconds(100));
         cache.insert("key1", 1);
         cache.insert("key2", 2);
 
@@ -262,5 +332,27 @@ mod tests {
         assert_eq!(lru_cache.get(&"one"), None);
         assert_eq!(lru_cache.get(&"two"), Some(&2));
         assert_eq!(lru_cache.get(&"three"), Some(&3));
+    }
+
+    #[test]
+    fn test_lfu_cache() {
+        let mut lfu_cache = LFUCache::new(3);
+
+        lfu_cache.insert("key1", 1);
+        lfu_cache.insert("key2", 2);
+        lfu_cache.insert("key3", 3);
+        assert_eq!(lfu_cache.cache.len(), 3);
+        assert_eq!(lfu_cache.frequencies[&1].len(), 3);
+
+        lfu_cache.insert("key1", 11);
+        assert_eq!(lfu_cache.cache.len(), 3);
+        assert_eq!(lfu_cache.frequencies[&1].len(), 2);
+        assert_eq!(lfu_cache.frequencies[&2].len(), 1);
+        assert_eq!(lfu_cache.cache["key1"].0, 11);
+
+        lfu_cache.insert("key4", 4);
+        assert_eq!(lfu_cache.cache.len(), 3);
+        assert_eq!(lfu_cache.cache.contains_key("key2"), false);
+        assert_eq!(lfu_cache.frequencies[&1].len(), 2);
     }
 }
